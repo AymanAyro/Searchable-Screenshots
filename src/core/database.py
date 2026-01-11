@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 from contextlib import contextmanager
+import asyncio
 
 
 @dataclass
@@ -200,6 +201,46 @@ class Database:
         with self._connection() as conn:
             cursor = conn.execute("SELECT file_path, file_hash FROM screenshots")
             return {row[0]: row[1] for row in cursor.fetchall()}
+    
+    def get_by_paths_batch(self, file_paths: list[str]) -> dict[str, Optional[Screenshot]]:
+        """Get multiple screenshots by their file paths in a single query.
+        
+        Args:
+            file_paths: List of file paths to look up
+            
+        Returns:
+            Dictionary mapping file_path -> Screenshot (or None if not found)
+        """
+        if not file_paths:
+            return {}
+        
+        with self._connection() as conn:
+            # Use IN clause for batch lookup
+            placeholders = ','.join('?' * len(file_paths))
+            cursor = conn.execute(
+                f"SELECT * FROM screenshots WHERE file_path IN ({placeholders})",
+                file_paths
+            )
+            results = {row[1]: Screenshot.from_row(row) for row in cursor.fetchall()}
+            # Add None for paths not found
+            return {path: results.get(path) for path in file_paths}
+    
+    # Async wrappers for non-blocking operations
+    async def get_by_path_async(self, file_path: str) -> Optional[Screenshot]:
+        """Async wrapper for get_by_path."""
+        return await asyncio.to_thread(self.get_by_path, file_path)
+    
+    async def get_by_paths_batch_async(self, file_paths: list[str]) -> dict[str, Optional[Screenshot]]:
+        """Async wrapper for get_by_paths_batch."""
+        return await asyncio.to_thread(self.get_by_paths_batch, file_paths)
+    
+    async def insert_async(self, screenshot: Screenshot) -> int:
+        """Async wrapper for insert."""
+        return await asyncio.to_thread(self.insert, screenshot)
+    
+    async def update_async(self, screenshot: Screenshot) -> None:
+        """Async wrapper for update."""
+        return await asyncio.to_thread(self.update, screenshot)
     
     def fts_search(self, query: str, limit: int = 50) -> list[Screenshot]:
         """Search using FTS5 full-text search."""

@@ -1,10 +1,18 @@
-"""Optional reranker service for improving search result quality."""
+"""Optional reranker service for improving search result quality.
+
+Note: Reranker requires sentence-transformers which depends on torch.
+If torch is not installed, reranker functionality will be disabled.
+"""
 
 from typing import Optional
 
 
 class RerankerService:
-    """Rerank search results using cross-encoder model."""
+    """Rerank search results using cross-encoder model.
+    
+    Requires sentence-transformers (which requires torch) to be installed.
+    If not available, reranking will be disabled.
+    """
     
     def __init__(self, model_name: str = "mixedbread-ai/mxbai-rerank-large-v1"):
         """Initialize the reranker.
@@ -14,12 +22,30 @@ class RerankerService:
         """
         self.model_name = model_name
         self._model = None
+        self._available = False
+        self._check_availability()
+    
+    def _check_availability(self):
+        """Check if sentence-transformers is available."""
+        try:
+            import sentence_transformers
+            self._available = True
+        except ImportError:
+            self._available = False
+            print("Warning: sentence-transformers not available. Reranker disabled.")
+            print("To enable reranker, install: uv add sentence-transformers")
     
     def _load_model(self):
         """Lazy load the model to avoid startup overhead."""
+        if not self._available:
+            raise RuntimeError("Reranker not available: sentence-transformers not installed")
+        
         if self._model is None:
-            from sentence_transformers import CrossEncoder
-            self._model = CrossEncoder(self.model_name)
+            try:
+                from sentence_transformers import CrossEncoder
+                self._model = CrossEncoder(self.model_name)
+            except ImportError:
+                raise RuntimeError("sentence-transformers not available. Install with: uv add sentence-transformers")
     
     def rerank(
         self,
@@ -39,6 +65,10 @@ class RerankerService:
         """
         if not documents:
             return []
+        
+        if not self._available:
+            # Return original order if reranker not available
+            return [(i, 1.0) for i in range(len(documents))]
         
         self._load_model()
         
@@ -85,3 +115,8 @@ class RerankerService:
     def is_loaded(self) -> bool:
         """Check if the model is loaded."""
         return self._model is not None
+    
+    @property
+    def is_available(self) -> bool:
+        """Check if reranker is available (sentence-transformers installed)."""
+        return self._available

@@ -6,9 +6,14 @@ from typing import Optional
 from PIL import Image
 import io
 import httpx
+import time
+import asyncio
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
+
+from ..core.logging import get_logger
+from ..core.retry import retry_with_backoff, CircuitBreaker
 
 
 class VisionAPIError(Exception):
@@ -20,7 +25,7 @@ class VisionService:
     """Generate visual descriptions of screenshots using Moondream via LangChain."""
     
     DEFAULT_PROMPT = (
-        """
+         """
 ### SYSTEM ROLE
 You are a Computer Vision Indexer. Your job is to extract searchable data from images.
 
@@ -67,11 +72,21 @@ main content, and any visible text. Be concise and searchable."""
         model: str = "gemma3:4b",
         timeout: float = 120.0,
         prompt_style: str = "detailed",
+        max_retries: int = 3,
+        retry_backoff_factor: float = 2.0,
+        retry_initial_delay: float = 1.0,
     ):
         self.ollama_url = ollama_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.prompt_style = prompt_style  # "fast" or "detailed"
+        self.max_retries = max_retries
+        self.retry_backoff_factor = retry_backoff_factor
+        self.retry_initial_delay = retry_initial_delay
+        
+        self.logger = get_logger(__name__)
+        self.circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=60.0)
+        self._last_success_time: Optional[float] = None
         
         # Validate model name format (Ollama models typically use format "name:tag")
         if not model or not model.strip():
@@ -92,7 +107,9 @@ main content, and any visible text. Be concise and searchable."""
                     "reasoning": False,  # Disable reasoning for faster responses (if model supports it)
                 },
             )
+            self.logger.info(f"Initialized vision service with model '{model}'")
         except Exception as e:
+            self.logger.error(f"Failed to initialize vision model '{model}': {e}")
             raise ValueError(
                 f"Failed to initialize vision model '{model}'. "
                 f"Please verify the model exists in Ollama (run 'ollama list' to see available models). "
@@ -170,7 +187,7 @@ main content, and any visible text. Be concise and searchable."""
                 img.save(buffered, format="JPEG", quality=quality)
                 return base64.b64encode(buffered.getvalue()).decode("utf-8")
         except Exception as e:
-            print(f"Error encoding image {image_path}: {e}")
+            self.logger.error(f"Error encoding image {image_path}: {e}")
             return None
     
     def _encode_image(self, image_path: Path, max_size: tuple[int, int] = (1920, 1920)) -> Optional[str]:
@@ -208,8 +225,14 @@ main content, and any visible text. Be concise and searchable."""
         else:
             prompt_text = prompt
         
-        try:
-            # Create messages with image (using base64 encoded data)
+        @retry_with_backoff(
+            max_retries=self.max_retries,
+            initial_delay=self.retry_initial_delay,
+            backoff_factor=self.retry_backoff_factor,
+            exceptions=(Exception,),
+            logger=self.logger,
+        )
+        def _invoke_llm():
             messages = [
                 SystemMessage(content=prompt_text),
                 HumanMessage(
@@ -227,10 +250,15 @@ main content, and any visible text. Be concise and searchable."""
                     ]
                 )
             ]
-            
-            # Invoke LangChain LLM
-            response = self._llm.invoke(messages)
-            return response.content.strip() if hasattr(response, 'content') else str(response).strip()
+            return self._llm.invoke(messages)
+        
+        try:
+            # Use circuit breaker for API calls
+            response = self.circuit_breaker.call(_invoke_llm)
+            result = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+            self._last_success_time = time.time()
+            self.logger.debug(f"Generated description for {image_path.name} ({len(result)} chars)")
+            return result
         except Exception as e:
             # Check if it's a network/server error or model error
             error_str = str(e).lower()
@@ -247,16 +275,17 @@ main content, and any visible text. Be concise and searchable."""
                         f"Direct API fallback also failed: {fallback_error}. "
                         f"Please verify the model exists and supports vision (run 'ollama show {self.model}')."
                     ) from fallback_error
-            print(f"Vision service failed for {image_path}: {e}")
+            self.logger.error(f"Vision service failed for {image_path}: {e}")
             return None
     
     async def describe_async(self, image_path: Path, prompt: Optional[str] = None) -> Optional[str]:
         """Async version of describe()."""
+        import asyncio
+        
         if not image_path.exists():
             return None
         
         # Run image encoding in a thread to avoid blocking
-        import asyncio
         image_data = await asyncio.to_thread(self._encode_image, image_path)
         if not image_data:
             return None
@@ -290,9 +319,21 @@ main content, and any visible text. Be concise and searchable."""
                 )
             ]
             
-            # Invoke LangChain LLM asynchronously
-            response = await self._llm.ainvoke(messages)
-            return response.content.strip() if hasattr(response, 'content') else str(response).strip()
+            # Invoke LangChain LLM asynchronously with retry
+            for attempt in range(self.max_retries + 1):
+                try:
+                    response = await self._llm.ainvoke(messages)
+                    result = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+                    self._last_success_time = time.time()
+                    self.logger.debug(f"Generated description for {image_path.name} ({len(result)} chars)")
+                    return result
+                except Exception as e:
+                    if attempt < self.max_retries:
+                        delay = self.retry_initial_delay * (self.retry_backoff_factor ** attempt)
+                        self.logger.warning(f"Vision API call failed (attempt {attempt + 1}/{self.max_retries + 1}), retrying in {delay:.2f}s: {e}")
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
         except Exception as e:
             # Check if it's a network/server error or model error
             error_str = str(e).lower()
@@ -309,7 +350,7 @@ main content, and any visible text. Be concise and searchable."""
                         f"Direct API fallback also failed: {fallback_error}. "
                         f"Please verify the model exists and supports vision (run 'ollama show {self.model}')."
                     ) from fallback_error
-            print(f"Vision API error for {image_path}: {e}")
+            self.logger.error(f"Vision API error for {image_path}: {e}")
             return None
     
     def _describe_direct_api(
@@ -442,6 +483,8 @@ main content, and any visible text. Be concise and searchable."""
     
     def is_available(self) -> bool:
         """Check if the vision service is available."""
+        if self.circuit_breaker.is_open:
+            return False
         try:
             # Try to invoke with a simple test message
             test_messages = [SystemMessage(content="test"), HumanMessage(content="test")]
@@ -449,6 +492,22 @@ main content, and any visible text. Be concise and searchable."""
             return True
         except Exception:
             return False
+    
+    def get_health_status(self) -> dict:
+        """Get detailed health status of the vision service.
+        
+        Returns:
+            Dictionary with health status information
+        """
+        is_available = self.is_available()
+        return {
+            "available": is_available,
+            "model": self.model,
+            "ollama_url": self.ollama_url,
+            "circuit_state": self.circuit_breaker._state.value,
+            "last_success_time": self._last_success_time,
+            "failure_count": self.circuit_breaker._failure_count,
+        }
     
     def close(self) -> None:
         """Close the LLM client (no-op for LangChain, but kept for compatibility)."""

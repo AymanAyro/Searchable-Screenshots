@@ -158,6 +158,16 @@ class ScreenshotProcessor:
         # Step 3: Combine text for embedding
         combined_text = self._combine_for_embedding(ocr_text, visual_desc)
         
+        # Debug logging for text combination
+        if combined_text:
+            ocr_len = len(ocr_text) if ocr_text else 0
+            visual_len = len(visual_desc) if visual_desc else 0
+            combined_len = len(combined_text)
+            # Log first 200 chars of combined text for debugging
+            preview = combined_text[:200].replace('\n', ' ') + ('...' if len(combined_text) > 200 else '')
+            print(f"DEBUG EMBEDDING - {image_path.name}: OCR={ocr_len} chars, Visual={visual_len} chars, Combined={combined_len} chars")
+            print(f"DEBUG EMBEDDING - Preview: {preview}")
+        
         # Step 4: Generate embedding - REQUIRED for storage
         if not combined_text:
             raise ValueError(f"No text content to embed for {image_path}")
@@ -513,14 +523,19 @@ class ScreenshotProcessor:
         images = self.discover_images(folders)
         stats.total_files = len(images)
         
+        print(f"Discovered {len(images)} total images")
+        
         if not force:
             new_images, changed_images, unchanged_images = self.check_changes(images)
             stats.skipped = len(unchanged_images)
             to_process = new_images + changed_images
+            print(f"To process: {len(new_images)} new, {len(changed_images)} changed, {len(unchanged_images)} unchanged")
         else:
             to_process = images
+            print(f"Force mode: processing all {len(to_process)} images")
         
         if not to_process:
+            print("No images to process")
             return stats
         
         # Check for cancellation
@@ -576,6 +591,7 @@ class ScreenshotProcessor:
         # Phase 3: Process images in parallel (OCR + Vision)
         semaphore = asyncio.Semaphore(concurrency)
         completed_count = 0
+        completed_lock = asyncio.Lock()
         
         @dataclass
         class ProcessedImage:
@@ -587,6 +603,7 @@ class ScreenshotProcessor:
             visual_desc: Optional[str]
             existing: Optional[Screenshot]
             error: Optional[Exception] = None
+            cancelled: bool = False
         
         processed_images: list[ProcessedImage] = []
         
@@ -596,13 +613,25 @@ class ScreenshotProcessor:
             async with semaphore:
                 # Check cancellation
                 if cancel_check and cancel_check():
-                    return None
+                    return ProcessedImage(
+                        image_path=image_path,
+                        path_str=path_str,
+                        file_hash=file_hash,
+                        ocr_text=None,
+                        visual_desc=None,
+                        existing=existing,
+                        cancelled=True,
+                    )
+                
+                # Thread-safe increment of completed_count
+                async with completed_lock:
+                    completed_count += 1
+                    current_count = completed_count
                 
                 if progress_callback:
-                    completed_count += 1
                     progress_callback(ProcessingProgress(
                         current_file=path_str,
-                        current_index=completed_count,
+                        current_index=current_count,
                         total_files=len(to_process),
                         status="processing",
                     ))
@@ -628,12 +657,13 @@ class ScreenshotProcessor:
                     )
                     
                 except VisionAPIError as e:
-                    stats.failed += 1
+                    async with completed_lock:
+                        stats.failed += 1
                     print(f"Vision API error, skipping {image_path}: {e}")
                     if progress_callback:
                         progress_callback(ProcessingProgress(
                             current_file=path_str,
-                            current_index=completed_count,
+                            current_index=current_count,
                             total_files=len(to_process),
                             status="api_error",
                             error_message=str(e),
@@ -649,12 +679,15 @@ class ScreenshotProcessor:
                     )
                     
                 except Exception as e:
-                    stats.failed += 1
+                    async with completed_lock:
+                        stats.failed += 1
                     print(f"Failed to process {image_path}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     if progress_callback:
                         progress_callback(ProcessingProgress(
                             current_file=path_str,
-                            current_index=completed_count,
+                            current_index=current_count,
                             total_files=len(to_process),
                             status="failed",
                             error_message=str(e),
@@ -676,10 +709,77 @@ class ScreenshotProcessor:
             process_one(img, path_str, file_hash, existing_map.get(path_str), i)
             for i, (img, path_str, file_hash) in enumerate(zip(to_process, image_paths_filtered, file_hashes))
         ]
-        processed_images = await asyncio.gather(*tasks)
+        processed_images = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Filter out failed images
-        successful_images = [p for p in processed_images if p and p.error is None and p.ocr_text is not None and p.visual_desc is not None]
+        # Handle any exceptions that weren't caught
+        valid_processed_images = []
+        for i, result in enumerate(processed_images):
+            if isinstance(result, Exception):
+                # Unhandled exception - create error entry
+                path_str = image_paths_filtered[i] if i < len(image_paths_filtered) else "unknown"
+                print(f"Unhandled exception processing image {path_str}: {result}")
+                import traceback
+                traceback.print_exc()
+                stats.failed += 1
+                valid_processed_images.append(ProcessedImage(
+                    image_path=to_process[i] if i < len(to_process) else Path("unknown"),
+                    path_str=path_str,
+                    file_hash=file_hashes[i] if i < len(file_hashes) else "",
+                    ocr_text=None,
+                    visual_desc=None,
+                    existing=None,
+                    error=result,
+                ))
+            elif result is None:
+                # Should not happen, but handle it
+                path_str = image_paths_filtered[i] if i < len(image_paths_filtered) else "unknown"
+                print(f"Warning: process_one returned None for {path_str}")
+                stats.failed += 1
+            else:
+                valid_processed_images.append(result)
+        
+        # Filter out failed/cancelled images - keep only successful ones
+        # Note: We can process images with OCR=None as long as we have vision description
+        # We can also process images with Vision=None as long as we have OCR text
+        # Only fail if BOTH are None or if there's an error
+        successful_images = []
+        failed_during_processing = []
+        
+        for p in valid_processed_images:
+            if p.cancelled:
+                failed_during_processing.append((p.path_str, "cancelled"))
+            elif p.error is not None:
+                failed_during_processing.append((p.path_str, f"error: {p.error}"))
+            elif p.ocr_text is None and p.visual_desc is None:
+                # Both OCR and Vision failed - cannot process
+                failed_during_processing.append((p.path_str, "Both OCR and Vision returned None"))
+            elif p.ocr_text is None:
+                # OCR failed but Vision succeeded - we can still process
+                print(f"Warning: OCR returned None for {Path(p.path_str).name}, but Vision succeeded - will use Vision only")
+                successful_images.append(p)
+            elif p.visual_desc is None:
+                # Vision failed but OCR succeeded - we can still process
+                print(f"Warning: Vision returned None for {Path(p.path_str).name}, but OCR succeeded - will use OCR only")
+                successful_images.append(p)
+            else:
+                # Both succeeded
+                successful_images.append(p)
+        
+        # Log detailed failure information
+        if failed_during_processing:
+            print(f"\n=== FAILED IMAGES DURING OCR/VISION PROCESSING ===")
+            import sys
+            sys.stdout.flush()
+            for path, reason in failed_during_processing:
+                filename = Path(path).name if path else "unknown"
+                print(f"  - {filename}: {reason}")
+                sys.stdout.flush()
+            print(f"Total failed: {len(failed_during_processing)}\n")
+            sys.stdout.flush()
+        else:
+            print(f"\nNo images failed during OCR/Vision processing\n")
+            import sys
+            sys.stdout.flush()
         
         if not successful_images:
             return stats
@@ -697,6 +797,8 @@ class ScreenshotProcessor:
         # Also chunk very long texts if needed
         valid_images = []
         combined_texts = []
+        failed_text_combination = []
+        
         for p in successful_images:
             combined = self._combine_for_embedding(p.ocr_text, p.visual_desc)
             if combined:
@@ -709,6 +811,15 @@ class ScreenshotProcessor:
                 combined_texts.append(combined)
             else:
                 stats.failed += 1
+                ocr_len = len(p.ocr_text) if p.ocr_text else 0
+                vision_len = len(p.visual_desc) if p.visual_desc else 0
+                failed_text_combination.append((p.path_str, f"OCR: {ocr_len} chars, Vision: {vision_len} chars"))
+        
+        if failed_text_combination:
+            print(f"\n=== FAILED IMAGES DURING TEXT COMBINATION ===")
+            for path, reason in failed_text_combination:
+                print(f"  - {Path(path).name}: {reason}")
+            print(f"Total failed: {len(failed_text_combination)}\n")
         
         if not valid_images:
             return stats
@@ -719,12 +830,21 @@ class ScreenshotProcessor:
         # Filter out images with failed embeddings
         final_images = []
         final_embeddings = []
+        failed_embeddings = []
+        
         for p, emb in zip(valid_images, embedding_vectors):
             if emb is not None:
                 final_images.append(p)
                 final_embeddings.append(emb)
             else:
                 stats.failed += 1
+                failed_embeddings.append(p.path_str)
+        
+        if failed_embeddings:
+            print(f"\n=== FAILED IMAGES DURING EMBEDDING GENERATION ===")
+            for path in failed_embeddings:
+                print(f"  - {Path(path).name}: embedding returned None")
+            print(f"Total failed: {len(failed_embeddings)}\n")
         
         if not final_images:
             return stats
@@ -836,6 +956,22 @@ class ScreenshotProcessor:
         # Update stats
         stats.new_indexed = len(screenshots_to_insert)
         stats.updated = len(screenshots_to_update)
+        
+        # Final summary with breakdown
+        total_failed = len(failed_during_processing) + len(failed_text_combination) + len(failed_embeddings)
+        print(f"\n=== FINAL PROCESSING SUMMARY ===")
+        print(f"Total discovered: {stats.total_files}")
+        print(f"Total processed: {len(to_process)}")
+        print(f"Successfully indexed: {len(final_images)}")
+        print(f"  - New: {stats.new_indexed}")
+        print(f"  - Updated: {stats.updated}")
+        print(f"  - Skipped (unchanged): {stats.skipped}")
+        print(f"Failed: {total_failed}")
+        print(f"  - During OCR/Vision: {len(failed_during_processing)}")
+        print(f"  - During text combination: {len(failed_text_combination)}")
+        print(f"  - During embedding: {len(failed_embeddings)}")
+        print(f"Stats.failed counter: {stats.failed}")
+        print("=" * 40)
         
         if progress_callback:
             progress_callback(ProcessingProgress(

@@ -2,8 +2,12 @@
 
 from typing import Optional
 import hashlib
+import time
 
 from langchain_ollama import OllamaEmbeddings
+
+from ..core.logging import get_logger
+from ..core.retry import retry_with_backoff, CircuitBreaker
 
 
 class EmbeddingService:
@@ -15,11 +19,22 @@ class EmbeddingService:
         model: str = "mxbai-embed-large",
         timeout: float = 60.0,
         cache_enabled: bool = True,
+        max_retries: int = 3,
+        retry_backoff_factor: float = 2.0,
+        retry_initial_delay: float = 1.0,
     ):
         self.ollama_url = ollama_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.cache_enabled = cache_enabled
+        self.max_retries = max_retries
+        self.retry_backoff_factor = retry_backoff_factor
+        self.retry_initial_delay = retry_initial_delay
+        
+        self.logger = get_logger(__name__)
+        self.circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=60.0)
+        self._last_success_time: Optional[float] = None
+        
         # Initialize LangChain OllamaEmbeddings
         # Note: New version handles timeout internally via httpx client
         self._embeddings = OllamaEmbeddings(
@@ -29,6 +44,7 @@ class EmbeddingService:
         self._dimension: Optional[int] = None
         # Embedding cache: text hash -> embedding vector
         self._cache: dict[str, list[float]] = {}
+        self.logger.info(f"Initialized embedding service with model '{model}'")
     
     def _get_text_hash(self, text: str) -> str:
         """Generate hash for text to use as cache key."""
@@ -58,9 +74,19 @@ class EmbeddingService:
             if text_hash in self._cache:
                 return self._cache[text_hash]
         
+        @retry_with_backoff(
+            max_retries=self.max_retries,
+            initial_delay=self.retry_initial_delay,
+            backoff_factor=self.retry_backoff_factor,
+            exceptions=(Exception,),
+            logger=self.logger,
+        )
+        def _embed_text():
+            return self._embeddings.embed_query(cleaned_text)
+        
         try:
-            # LangChain embeddings.embed_query returns a list of floats
-            embedding = self._embeddings.embed_query(cleaned_text)
+            # Use circuit breaker for API calls
+            embedding = self.circuit_breaker.call(_embed_text)
             
             if embedding:
                 self._dimension = len(embedding)
@@ -68,11 +94,12 @@ class EmbeddingService:
                 if self.cache_enabled:
                     text_hash = self._get_text_hash(cleaned_text)
                     self._cache[text_hash] = embedding
+                self._last_success_time = time.time()
                 return embedding
             else:
                 return None
         except Exception as e:
-            print(f"Embedding service failed: {e}")
+            self.logger.error(f"Embedding service failed: {e}")
             return None
     
     async def embed_async(self, text: str) -> Optional[list[float]]:
@@ -88,20 +115,30 @@ class EmbeddingService:
             if text_hash in self._cache:
                 return self._cache[text_hash]
         
+        import asyncio
+        
         try:
-            # LangChain async embeddings
-            embedding = await self._embeddings.aembed_query(cleaned_text)
-            
-            if embedding:
-                self._dimension = len(embedding)
-                # Cache the result if enabled
-                if self.cache_enabled:
-                    text_hash = self._get_text_hash(cleaned_text)
-                    self._cache[text_hash] = embedding
-            
-            return embedding
+            # Retry logic for async calls
+            for attempt in range(self.max_retries + 1):
+                try:
+                    embedding = await self._embeddings.aembed_query(cleaned_text)
+                    if embedding:
+                        self._dimension = len(embedding)
+                        # Cache the result if enabled
+                        if self.cache_enabled:
+                            text_hash = self._get_text_hash(cleaned_text)
+                            self._cache[text_hash] = embedding
+                        self._last_success_time = time.time()
+                    return embedding
+                except Exception as e:
+                    if attempt < self.max_retries:
+                        delay = self.retry_initial_delay * (self.retry_backoff_factor ** attempt)
+                        self.logger.warning(f"Embedding API call failed (attempt {attempt + 1}/{self.max_retries + 1}), retrying in {delay:.2f}s: {e}")
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
         except Exception as e:
-            print(f"Embedding API error: {e}")
+            self.logger.error(f"Embedding API error: {e}")
             return None
     
     def embed_batch(self, texts: list[str]) -> list[Optional[list[float]]]:
@@ -136,7 +173,7 @@ class EmbeddingService:
             
             return result
         except Exception as e:
-            print(f"Embedding batch failed: {e}")
+            self.logger.error(f"Embedding batch failed: {e}")
             return [None] * len(texts)
     
     async def embed_batch_async(self, texts: list[str]) -> list[Optional[list[float]]]:
@@ -171,7 +208,7 @@ class EmbeddingService:
             
             return result
         except Exception as e:
-            print(f"Embedding batch async failed: {e}")
+            self.logger.error(f"Embedding batch async failed: {e}")
             return [None] * len(texts)
     
     @property
@@ -181,12 +218,31 @@ class EmbeddingService:
     
     def is_available(self) -> bool:
         """Check if the embedding service is available."""
+        if self.circuit_breaker.is_open:
+            return False
         try:
             # Try to embed a test string
             test_embedding = self._embeddings.embed_query("test")
             return test_embedding is not None and len(test_embedding) > 0
         except Exception:
             return False
+    
+    def get_health_status(self) -> dict:
+        """Get detailed health status of the embedding service.
+        
+        Returns:
+            Dictionary with health status information
+        """
+        is_available = self.is_available()
+        return {
+            "available": is_available,
+            "model": self.model,
+            "ollama_url": self.ollama_url,
+            "circuit_state": self.circuit_breaker._state.value,
+            "last_success_time": self._last_success_time,
+            "failure_count": self.circuit_breaker._failure_count,
+            "cache_size": len(self._cache),
+        }
     
     def clear_cache(self) -> None:
         """Clear the embedding cache."""

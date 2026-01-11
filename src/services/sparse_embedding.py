@@ -86,6 +86,47 @@ class SparseEmbeddingService:
         
         return tokens
     
+    def tokenize_with_debug(self, text: str, doc_id: Optional[int] = None) -> tuple[list[str], dict]:
+        """Tokenize text and return debug information.
+        
+        Args:
+            text: Text to tokenize
+            doc_id: Optional document ID for logging
+            
+        Returns:
+            Tuple of (tokens, debug_info)
+        """
+        if not text:
+            return [], {}
+        
+        original_text = text
+        text_lower = text.lower()
+        text_cleaned = re.sub(r'[^\w\s]', ' ', text_lower)
+        words_before_stop = text_cleaned.split()
+        
+        tokens_after_stop = [t for t in words_before_stop if not self.remove_stop_words or t not in STOP_WORDS]
+        
+        if self.use_stemming and self._stemmer:
+            tokens_final = [self._stemmer.stem(t) for t in tokens_after_stop]
+        else:
+            tokens_final = tokens_after_stop
+        
+        debug_info = {
+            'original_length': len(original_text),
+            'words_before_stop': len(words_before_stop),
+            'tokens_after_stop': len(tokens_after_stop),
+            'tokens_final': len(tokens_final),
+            'sample_tokens': tokens_final[:20],  # First 20 tokens
+        }
+        
+        # Check for specific keywords
+        keywords_to_check = ['cat', 'cats', 'kitten', 'kittens']
+        found_keywords = [kw for kw in keywords_to_check if kw in tokens_final]
+        if found_keywords:
+            debug_info['found_keywords'] = found_keywords
+        
+        return tokens_final, debug_info
+    
     def fit(self, documents: list[tuple[int, str]]) -> None:
         """Train BM25 on a corpus of documents.
         

@@ -56,6 +56,17 @@ class AppConfig:
     query_cache_enabled: bool = True
     use_query_expansion: bool = False
     hybrid_normalization: str = "rrf"  # "rrf", "minmax", or "sigmoid"
+    # Search quality settings
+    min_search_score: float = 0.0  # Minimum score threshold for results
+    time_boost_factor: float = 0.1  # Boost factor for recent screenshots (0.0 = disabled)
+    # Retry settings
+    max_retries: int = 3  # Maximum retry attempts for API calls
+    retry_backoff_factor: float = 2.0  # Exponential backoff multiplier
+    retry_initial_delay: float = 1.0  # Initial retry delay in seconds
+    # Logging settings
+    log_level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    log_file: Optional[str] = None  # Path to log file (None = no file logging)
+    log_console: bool = True  # Enable console logging
     
     def to_dict(self) -> dict:
         return {
@@ -69,6 +80,14 @@ class AppConfig:
             "query_cache_enabled": self.query_cache_enabled,
             "use_query_expansion": self.use_query_expansion,
             "hybrid_normalization": self.hybrid_normalization,
+            "min_search_score": self.min_search_score,
+            "time_boost_factor": self.time_boost_factor,
+            "max_retries": self.max_retries,
+            "retry_backoff_factor": self.retry_backoff_factor,
+            "retry_initial_delay": self.retry_initial_delay,
+            "log_level": self.log_level,
+            "log_file": self.log_file,
+            "log_console": self.log_console,
         }
     
     @classmethod
@@ -84,6 +103,14 @@ class AppConfig:
             query_cache_enabled=data.get("query_cache_enabled", True),
             use_query_expansion=data.get("use_query_expansion", False),
             hybrid_normalization=data.get("hybrid_normalization", "rrf"),
+            min_search_score=data.get("min_search_score", 0.0),
+            time_boost_factor=data.get("time_boost_factor", 0.1),
+            max_retries=data.get("max_retries", 3),
+            retry_backoff_factor=data.get("retry_backoff_factor", 2.0),
+            retry_initial_delay=data.get("retry_initial_delay", 1.0),
+            log_level=data.get("log_level", "INFO"),
+            log_file=data.get("log_file"),
+            log_console=data.get("log_console", True),
         )
 
 
@@ -115,6 +142,7 @@ class ConfigManager:
                 data = json.load(f)
             return AppConfig.from_dict(data)
         except (json.JSONDecodeError, KeyError) as e:
+            # Use print here since logging may not be initialized yet
             print(f"Warning: Failed to load config, using defaults: {e}")
             return AppConfig()
     

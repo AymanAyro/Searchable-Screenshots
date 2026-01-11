@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 import threading
+import time
 
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -12,6 +13,8 @@ from qdrant_client.models import (
     VectorParams,
     HnswConfigDiff,
 )
+
+from ..core.logging import get_logger
 
 
 @dataclass
@@ -40,6 +43,9 @@ class VectorStore:
         self.dimension = dimension or self.DEFAULT_DIMENSION
         path.mkdir(parents=True, exist_ok=True)
         
+        self.logger = get_logger(__name__)
+        self._last_success_time: Optional[float] = None
+        
         # Thread lock for thread-safe operations
         self._lock = threading.Lock()
         self._closed = False
@@ -47,6 +53,7 @@ class VectorStore:
         # Initialize Qdrant client for collection management
         self.client = QdrantClient(path=str(path))
         self._ensure_collection()
+        self.logger.info(f"Initialized vector store at {path}")
         
         # Initialize LangChain Qdrant vector store for potential future use
         # We work with pre-computed vectors, so we use the client directly for now
@@ -161,6 +168,7 @@ class VectorStore:
                     collection_name=self.COLLECTION_NAME,
                     points=[point],
                 )
+                self._last_success_time = time.time()
             except Exception as e:
                 # If client is closed, try to recreate it
                 if "closed" in str(e).lower():
@@ -210,6 +218,7 @@ class VectorStore:
                     collection_name=self.COLLECTION_NAME,
                     points=points,
                 )
+                self._last_success_time = time.time()
             except Exception as e:
                 # If client is closed, try to recreate it
                 if "closed" in str(e).lower():
@@ -247,6 +256,7 @@ class VectorStore:
                     limit=limit,
                     score_threshold=score_threshold,
                 )
+                self._last_success_time = time.time()
             except Exception as e:
                 # If client is closed, try to recreate it
                 if "closed" in str(e).lower():
@@ -325,6 +335,39 @@ class VectorStore:
         with self._lock:
             self.client.delete_collection(self.COLLECTION_NAME)
             self._ensure_collection()
+            self.logger.info("Cleared vector store collection")
+    
+    def is_available(self) -> bool:
+        """Check if the vector store is available."""
+        try:
+            with self._lock:
+                info = self.client.get_collection(self.COLLECTION_NAME)
+                return True
+        except Exception:
+            return False
+    
+    def get_health_status(self) -> dict:
+        """Get detailed health status of the vector store.
+        
+        Returns:
+            Dictionary with health status information
+        """
+        try:
+            with self._lock:
+                info = self.client.get_collection(self.COLLECTION_NAME)
+                return {
+                    "available": True,
+                    "collection_name": self.COLLECTION_NAME,
+                    "vector_count": info.points_count,
+                    "dimension": self.dimension,
+                    "last_success_time": self._last_success_time,
+                }
+        except Exception as e:
+            return {
+                "available": False,
+                "error": str(e),
+                "collection_name": self.COLLECTION_NAME,
+            }
     
     def close(self) -> None:
         """Close the client connection."""
@@ -333,6 +376,7 @@ class VectorStore:
                 self._closed = True
                 try:
                     self.client.close()
+                    self.logger.info("Closed vector store connection")
                 except Exception:
                     pass  # Ignore errors when closing
         # LangChain vector store doesn't need explicit closing

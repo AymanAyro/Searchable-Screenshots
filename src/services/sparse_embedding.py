@@ -1,10 +1,32 @@
 """Sparse embedding service using BM25 for lexical search."""
 
 import pickle
+import re
 from pathlib import Path
 from typing import Optional
 import numpy as np
 from rank_bm25 import BM25Okapi
+
+# Try to import stemming library, fall back if not available
+try:
+    from nltk.stem import PorterStemmer
+    STEMMING_AVAILABLE = True
+except ImportError:
+    STEMMING_AVAILABLE = False
+    PorterStemmer = None
+
+# Common English stop words
+STOP_WORDS = {
+    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
+    'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the',
+    'to', 'was', 'will', 'with', 'the', 'this', 'but', 'they', 'have',
+    'had', 'what', 'said', 'each', 'which', 'their', 'time', 'if',
+    'up', 'out', 'many', 'then', 'them', 'these', 'so', 'some', 'her',
+    'would', 'make', 'like', 'into', 'him', 'has', 'two', 'more',
+    'very', 'after', 'words', 'long', 'than', 'first', 'been', 'call',
+    'who', 'oil', 'sit', 'now', 'find', 'down', 'day', 'did', 'get',
+    'come', 'made', 'may', 'part'
+}
 
 
 class SparseEmbeddingService:
@@ -14,22 +36,55 @@ class SparseEmbeddingService:
     The corpus is trained on document texts and scores are computed at query time.
     """
     
-    def __init__(self):
+    def __init__(self, use_stemming: bool = True, remove_stop_words: bool = True):
+        """Initialize sparse embedding service.
+        
+        Args:
+            use_stemming: Whether to use Porter stemming (requires nltk)
+            remove_stop_words: Whether to remove common stop words
+        """
         self._bm25: Optional[BM25Okapi] = None
         self._corpus: list[str] = []
         self._doc_ids: list[int] = []
         self._tokenized_corpus: list[list[str]] = []
-    
-    @staticmethod
-    def tokenize(text: str) -> list[str]:
-        """Tokenize text for BM25.
+        self.use_stemming = use_stemming and STEMMING_AVAILABLE
+        self.remove_stop_words = remove_stop_words
         
-        Simple lowercase + whitespace tokenization.
-        Consistent tokenization is critical for BM25 accuracy.
+        if self.use_stemming:
+            self._stemmer = PorterStemmer()
+        else:
+            self._stemmer = None
+    
+    def tokenize(self, text: str) -> list[str]:
+        """Tokenize text for BM25 with optional stemming and stop word removal.
+        
+        Args:
+            text: Text to tokenize
+            
+        Returns:
+            List of tokens
         """
         if not text:
             return []
-        return text.lower().split()
+        
+        # Convert to lowercase
+        text = text.lower()
+        
+        # Remove special characters but keep alphanumeric and spaces
+        text = re.sub(r'[^\w\s]', ' ', text)
+        
+        # Split into words
+        tokens = text.split()
+        
+        # Remove stop words if enabled
+        if self.remove_stop_words:
+            tokens = [t for t in tokens if t not in STOP_WORDS]
+        
+        # Apply stemming if enabled
+        if self.use_stemming and self._stemmer:
+            tokens = [self._stemmer.stem(t) for t in tokens]
+        
+        return tokens
     
     def fit(self, documents: list[tuple[int, str]]) -> None:
         """Train BM25 on a corpus of documents.
@@ -55,7 +110,7 @@ class SparseEmbeddingService:
     def add_document(self, doc_id: int, text: str) -> None:
         """Add a single document to the corpus.
         
-        Note: This rebuilds the BM25 index. For batch additions, use fit().
+        Note: This rebuilds the BM25 index. For batch additions, use fit() or add_documents_batch().
         
         Args:
             doc_id: Unique document ID
@@ -75,6 +130,37 @@ class SparseEmbeddingService:
             self._tokenized_corpus.append(self.tokenize(text))
         
         # Rebuild BM25 index
+        if self._tokenized_corpus:
+            self._bm25 = BM25Okapi(self._tokenized_corpus)
+    
+    def add_documents_batch(self, documents: list[tuple[int, str]]) -> None:
+        """Add multiple documents to the corpus in a single batch operation.
+        
+        This is more efficient than calling add_document() multiple times
+        as it only rebuilds the BM25 index once.
+        
+        Args:
+            documents: List of (doc_id, text) tuples
+        """
+        if not documents:
+            return
+        
+        # Process all documents
+        for doc_id, text in documents:
+            if not text:
+                continue
+            
+            # Check if document already exists (update case)
+            if doc_id in self._doc_ids:
+                idx = self._doc_ids.index(doc_id)
+                self._corpus[idx] = text
+                self._tokenized_corpus[idx] = self.tokenize(text)
+            else:
+                self._doc_ids.append(doc_id)
+                self._corpus.append(text)
+                self._tokenized_corpus.append(self.tokenize(text))
+        
+        # Rebuild BM25 index once for all documents
         if self._tokenized_corpus:
             self._bm25 = BM25Okapi(self._tokenized_corpus)
     

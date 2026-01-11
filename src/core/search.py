@@ -1,8 +1,15 @@
-"""Unified search interface with query routing and hybrid search."""
+"""Unified search interface with query routing and hybrid search.
+
+This module uses LangChain services (embeddings, vector stores) while maintaining
+the same interface for backward compatibility.
+"""
 
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
+from collections import defaultdict
+import hashlib
+import time
 
 from ..core.database import Database, Screenshot
 from ..services.vector_store import VectorStore, VectorSearchResult
@@ -39,6 +46,8 @@ class SearchEngine:
         reranker: Optional[RerankerService] = None,
         use_reranker: bool = False,
         hybrid_weight: float = 0.5,
+        hybrid_normalization: str = "rrf",
+        use_query_expansion: bool = False,
     ):
         """Initialize the search engine.
         
@@ -50,19 +59,32 @@ class SearchEngine:
             reranker: Optional reranker service
             use_reranker: Whether to apply reranking
             hybrid_weight: Weight for hybrid search (0.0 = sparse only, 1.0 = dense only)
+            hybrid_normalization: Normalization method ("rrf", "minmax", "sigmoid")
+            use_query_expansion: Whether to use query expansion
         """
         self.db = db
         self.vector_store = vector_store
         self.embedding = embedding_service
         self.sparse_embedding = sparse_embedding
         self.reranker = reranker
-        self.use_reranker = use_reranker and reranker is not None
+        # Only enable reranker if it's requested AND available
+        self.use_reranker = (
+            use_reranker 
+            and reranker is not None 
+            and (hasattr(reranker, 'is_available') and reranker.is_available)
+        )
         self.hybrid_weight = max(0.0, min(1.0, hybrid_weight))  # Clamp to [0, 1]
+        self.hybrid_normalization = hybrid_normalization
+        self.use_query_expansion = use_query_expansion
+        # Query cache: query_hash -> (results, timestamp)
+        self._query_cache: dict[str, tuple[list[SearchResult], float]] = {}
+        self._cache_ttl = 300  # 5 minutes default TTL
     
     def search(
         self,
         query: str,
         limit: int = 20,
+        use_cache: bool = True,
     ) -> list[SearchResult]:
         """Search for screenshots matching query.
         
@@ -73,6 +95,7 @@ class SearchEngine:
         Args:
             query: Search query
             limit: Maximum number of results
+            use_cache: Whether to use query result cache
             
         Returns:
             List of search results ordered by relevance
@@ -82,17 +105,49 @@ class SearchEngine:
         if not query:
             return []
         
+        # Check cache if enabled
+        if use_cache:
+            cache_key = self._get_query_cache_key(query, limit)
+            if cache_key in self._query_cache:
+                cached_results, timestamp = self._query_cache[cache_key]
+                # Check if cache is still valid
+                if time.time() - timestamp < self._cache_ttl:
+                    return cached_results
+                else:
+                    # Remove expired cache entry
+                    del self._query_cache[cache_key]
+        
         # Query routing based on quotes
         if self._is_exact_query(query):
             # Strip quotes and do FTS search
             exact_query = query[1:-1]
-            return self.fts_search(exact_query, limit)
+            results = self.fts_search(exact_query, limit)
         else:
             # Use hybrid search if sparse embedding is available
             if self.sparse_embedding and self.sparse_embedding.is_fitted:
-                return self.hybrid_search(query, limit)
+                results = self.hybrid_search(query, limit)
             else:
-                return self.vector_search(query, limit)
+                results = self.vector_search(query, limit)
+        
+        # Cache results if enabled
+        if use_cache:
+            cache_key = self._get_query_cache_key(query, limit)
+            self._query_cache[cache_key] = (results, time.time())
+        
+        return results
+    
+    def _get_query_cache_key(self, query: str, limit: int) -> str:
+        """Generate cache key for query."""
+        key_str = f"{query}:{limit}"
+        return hashlib.sha256(key_str.encode('utf-8')).hexdigest()
+    
+    def clear_cache(self) -> None:
+        """Clear the query result cache."""
+        self._query_cache.clear()
+    
+    def get_cache_size(self) -> int:
+        """Get the number of cached queries."""
+        return len(self._query_cache)
     
     def fts_search(
         self,
@@ -193,31 +248,49 @@ class SearchEngine:
         search_limit = limit * 3
         vector_results = self.vector_store.search(query_vector, search_limit)
         
-        # Get sparse BM25 scores (normalized)
-        sparse_scores = {}
+        # Expand query if enabled
+        search_query = self._expand_query(query) if self.use_query_expansion else query
+        
+        # Detect query type and adjust hybrid weight if adaptive
+        query_type = self._detect_query_type(query)
+        effective_weight = self._get_adaptive_weight(query_type)
+        
+        # Get sparse BM25 scores
+        sparse_scores_raw = {}
         if self.sparse_embedding and self.sparse_embedding.is_fitted:
-            for doc_id, score in self.sparse_embedding.get_scores_normalized(query):
-                sparse_scores[doc_id] = score
+            for doc_id, score in self.sparse_embedding.get_scores(search_query):
+                sparse_scores_raw[doc_id] = score
         
         # Build dense scores map
-        dense_scores = {vr.id: vr.score for vr in vector_results}
+        dense_scores_raw = {vr.id: vr.score for vr in vector_results}
         
-        # Get all candidate doc IDs
-        all_doc_ids = set(dense_scores.keys()) | set(sparse_scores.keys())
-        
-        # Combine scores
-        combined_results = []
-        for doc_id in all_doc_ids:
-            dense_score = dense_scores.get(doc_id, 0.0)
-            sparse_score = sparse_scores.get(doc_id, 0.0)
+        # Normalize scores based on selected method
+        if self.hybrid_normalization == "rrf":
+            # Use Reciprocal Rank Fusion
+            combined_results = self._normalize_scores_rrf(
+                dense_scores_raw, sparse_scores_raw, search_limit
+            )
+        else:
+            # Use min-max normalization (original method)
+            sparse_scores = self._normalize_minmax(sparse_scores_raw)
+            dense_scores = self._normalize_minmax(dense_scores_raw)
             
-            # Weighted combination
-            final_score = (1 - self.hybrid_weight) * sparse_score + self.hybrid_weight * dense_score
+            # Get all candidate doc IDs
+            all_doc_ids = set(dense_scores.keys()) | set(sparse_scores.keys())
             
-            combined_results.append((doc_id, final_score))
-        
-        # Sort by combined score descending
-        combined_results.sort(key=lambda x: x[1], reverse=True)
+            # Combine scores (both now in [0, 1] range)
+            combined_results = []
+            for doc_id in all_doc_ids:
+                dense_score = dense_scores.get(doc_id, 0.0)
+                sparse_score = sparse_scores.get(doc_id, 0.0)
+                
+                # Weighted combination using effective_weight
+                final_score = (1 - effective_weight) * sparse_score + effective_weight * dense_score
+                
+                combined_results.append((doc_id, final_score))
+            
+            # Sort by combined score descending
+            combined_results.sort(key=lambda x: x[1], reverse=True)
         
         # Fetch screenshot data and build results
         results = []
@@ -308,6 +381,136 @@ class SearchEngine:
             query.startswith('"') and
             query.endswith('"')
         )
+    
+    def _normalize_scores_rrf(
+        self,
+        dense_scores: dict[int, float],
+        sparse_scores: dict[int, float],
+        k: int = 60,
+    ) -> list[tuple[int, float]]:
+        """Normalize scores using Reciprocal Rank Fusion (RRF).
+        
+        RRF combines rankings from different sources without requiring score normalization.
+        Formula: RRF(d) = sum(1 / (k + rank(d, i))) for each ranking i
+        
+        Args:
+            dense_scores: Dict of doc_id -> dense score
+            sparse_scores: Dict of doc_id -> sparse score
+            k: RRF constant (typically 60)
+            
+        Returns:
+            List of (doc_id, rrf_score) tuples sorted by score descending
+        """
+        # Create rankings from scores
+        dense_ranking = sorted(dense_scores.items(), key=lambda x: x[1], reverse=True)
+        sparse_ranking = sorted(sparse_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Build rank maps (doc_id -> rank in each list)
+        dense_ranks = {doc_id: rank + 1 for rank, (doc_id, _) in enumerate(dense_ranking)}
+        sparse_ranks = {doc_id: rank + 1 for rank, (doc_id, _) in enumerate(sparse_ranking)}
+        
+        # Calculate RRF scores for all documents
+        all_doc_ids = set(dense_ranks.keys()) | set(sparse_ranks.keys())
+        rrf_scores = {}
+        
+        for doc_id in all_doc_ids:
+            rrf_score = 0.0
+            
+            # Add contribution from dense ranking
+            if doc_id in dense_ranks:
+                rrf_score += 1.0 / (k + dense_ranks[doc_id])
+            
+            # Add contribution from sparse ranking
+            if doc_id in sparse_ranks:
+                rrf_score += 1.0 / (k + sparse_ranks[doc_id])
+            
+            rrf_scores[doc_id] = rrf_score
+        
+        # Sort by RRF score descending
+        results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        return results
+    
+    def _normalize_minmax(self, scores: dict[int, float]) -> dict[int, float]:
+        """Normalize scores using min-max normalization to [0, 1] range."""
+        if not scores:
+            return {}
+        
+        values = list(scores.values())
+        min_val = min(values)
+        max_val = max(values)
+        score_range = max_val - min_val
+        
+        if score_range == 0:
+            # All scores are the same
+            return {doc_id: 1.0 if score > 0 else 0.0 for doc_id, score in scores.items()}
+        
+        return {
+            doc_id: (score - min_val) / score_range
+            for doc_id, score in scores.items()
+        }
+    
+    def _expand_query(self, query: str) -> str:
+        """Expand query with synonyms and related terms.
+        
+        Args:
+            query: Original search query
+            
+        Returns:
+            Expanded query string
+        """
+        # Simple synonym expansion for common terms
+        synonyms = {
+            "error": ["error", "exception", "failure", "bug", "issue"],
+            "screenshot": ["screenshot", "image", "picture", "photo"],
+            "code": ["code", "program", "script", "source"],
+            "terminal": ["terminal", "console", "command", "shell"],
+            "window": ["window", "dialog", "popup", "panel"],
+        }
+        
+        words = query.lower().split()
+        expanded_words = set(words)
+        
+        for word in words:
+            if word in synonyms:
+                expanded_words.update(synonyms[word])
+        
+        return " ".join(expanded_words)
+    
+    def _detect_query_type(self, query: str) -> str:
+        """Detect query type to choose optimal search strategy.
+        
+        Args:
+            query: Search query
+            
+        Returns:
+            "exact" for exact match queries, "semantic" for semantic queries
+        """
+        # Simple heuristic: queries with quotes or very short queries are exact
+        if query.startswith('"') and query.endswith('"'):
+            return "exact"
+        
+        # Very short queries (1-2 words) might be exact
+        words = query.split()
+        if len(words) <= 2 and all(len(w) > 3 for w in words):
+            return "exact"
+        
+        return "semantic"
+    
+    def _get_adaptive_weight(self, query_type: str) -> float:
+        """Get adaptive hybrid weight based on query type.
+        
+        Args:
+            query_type: "exact" or "semantic"
+            
+        Returns:
+            Adjusted hybrid weight
+        """
+        if query_type == "exact":
+            # For exact queries, favor sparse (BM25) search
+            return max(0.0, self.hybrid_weight - 0.2)
+        else:
+            # For semantic queries, favor dense (vector) search
+            return min(1.0, self.hybrid_weight + 0.2)
     
     def _format_fts_query(self, query: str) -> str:
         """Format a query for FTS5 MATCH.

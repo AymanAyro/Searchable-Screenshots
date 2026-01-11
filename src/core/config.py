@@ -24,8 +24,8 @@ class ScanFolder:
 class APIConfig:
     """Configuration for external APIs (Ollama)."""
     ollama_url: str = "http://localhost:11434"
-    vision_model: str = "moondream:latest"
-    embed_model: str = "mxbai-embed-large"
+    vision_model: str = "gemma3:4b"
+    embed_model: str = "nomic-embed-text:latest"
     
     def to_dict(self) -> dict:
         return {
@@ -38,8 +38,8 @@ class APIConfig:
     def from_dict(cls, data: dict) -> "APIConfig":
         return cls(
             ollama_url=data.get("ollama_url", "http://localhost:11434"),
-            vision_model=data.get("vision_model", "moondream:latest"),
-            embed_model=data.get("embed_model", "mxbai-embed-large"),
+            vision_model=data.get("vision_model", "gemma3:4b"),
+            embed_model=data.get("embed_model", "nomic-embed-text:latest"),
         )
 
 
@@ -51,6 +51,11 @@ class AppConfig:
     use_reranker: bool = False
     hybrid_search_weight: float = 0.5  # 0.0 = sparse only, 1.0 = dense only
     parallel_processing: int = 1  # 1-20, concurrent images during indexing
+    vision_prompt_style: str = "detailed"  # "fast" or "detailed"
+    embedding_cache_enabled: bool = True
+    query_cache_enabled: bool = True
+    use_query_expansion: bool = False
+    hybrid_normalization: str = "rrf"  # "rrf", "minmax", or "sigmoid"
     
     def to_dict(self) -> dict:
         return {
@@ -59,6 +64,11 @@ class AppConfig:
             "use_reranker": self.use_reranker,
             "hybrid_search_weight": self.hybrid_search_weight,
             "parallel_processing": self.parallel_processing,
+            "vision_prompt_style": self.vision_prompt_style,
+            "embedding_cache_enabled": self.embedding_cache_enabled,
+            "query_cache_enabled": self.query_cache_enabled,
+            "use_query_expansion": self.use_query_expansion,
+            "hybrid_normalization": self.hybrid_normalization,
         }
     
     @classmethod
@@ -69,6 +79,11 @@ class AppConfig:
             use_reranker=data.get("use_reranker", False),
             hybrid_search_weight=data.get("hybrid_search_weight", 0.5),
             parallel_processing=data.get("parallel_processing", 1),
+            vision_prompt_style=data.get("vision_prompt_style", "detailed"),
+            embedding_cache_enabled=data.get("embedding_cache_enabled", True),
+            query_cache_enabled=data.get("query_cache_enabled", True),
+            use_query_expansion=data.get("use_query_expansion", False),
+            hybrid_normalization=data.get("hybrid_normalization", "rrf"),
         )
 
 

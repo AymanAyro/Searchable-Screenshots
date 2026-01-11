@@ -1,17 +1,16 @@
-"""Qdrant vector store wrapper for semantic search."""
+"""Qdrant vector store wrapper for semantic search using LangChain."""
 
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
+import threading
 
+from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
+    HnswConfigDiff,
 )
 
 
@@ -24,38 +23,105 @@ class VectorSearchResult:
 
 
 class VectorStore:
-    """Qdrant vector store for semantic screenshot search."""
+    """Qdrant vector store for semantic screenshot search using LangChain."""
     
     COLLECTION_NAME = "screenshots"
-    DEFAULT_DIMENSION = 1024  # mxbai-embed-large dimension
+    DEFAULT_DIMENSION = 768  # nomic-embed-text dimension (updated from 1024)
     
-    def __init__(self, path: Path, dimension: int = DEFAULT_DIMENSION):
+    def __init__(self, path: Path, dimension: Optional[int] = None):
         """Initialize the vector store.
         
         Args:
             path: Directory path for persistent storage
-            dimension: Embedding vector dimension
+            dimension: Embedding vector dimension (auto-detected if None)
         """
         self.path = path
-        self.dimension = dimension
+        # Use provided dimension or default
+        self.dimension = dimension or self.DEFAULT_DIMENSION
         path.mkdir(parents=True, exist_ok=True)
         
+        # Thread lock for thread-safe operations
+        self._lock = threading.Lock()
+        self._closed = False
+        
+        # Initialize Qdrant client for collection management
         self.client = QdrantClient(path=str(path))
         self._ensure_collection()
+        
+        # Initialize LangChain Qdrant vector store for potential future use
+        # We work with pre-computed vectors, so we use the client directly for now
+        # but keep LangChain integration available
+        from langchain_community.embeddings import FakeEmbeddings
+        dummy_embeddings = FakeEmbeddings(size=dimension)
+        
+        self._vector_store = QdrantVectorStore(
+            client=self.client,
+            collection_name=self.COLLECTION_NAME,
+            embedding=dummy_embeddings,
+        )
     
     def _ensure_collection(self) -> None:
-        """Create the collection if it doesn't exist."""
-        collections = self.client.get_collections().collections
-        collection_names = [c.name for c in collections]
-        
-        if self.COLLECTION_NAME not in collection_names:
-            self.client.create_collection(
-                collection_name=self.COLLECTION_NAME,
-                vectors_config=VectorParams(
-                    size=self.dimension,
-                    distance=Distance.COSINE,
-                ),
-            )
+        """Create the collection if it doesn't exist, or update if dimension mismatch."""
+        with self._lock:
+            try:
+                collections = self.client.get_collections().collections
+                collection_names = [c.name for c in collections]
+            except Exception as e:
+                # If client is closed, try to recreate it
+                if "closed" in str(e).lower():
+                    self.client = QdrantClient(path=str(self.path))
+                    collections = self.client.get_collections().collections
+                    collection_names = [c.name for c in collections]
+                else:
+                    raise
+            
+            if self.COLLECTION_NAME not in collection_names:
+                # Create new collection with correct dimension and optimized HNSW
+                # Optimize HNSW parameters for better search performance
+                hnsw_config = HnswConfigDiff(
+                    m=16,  # Number of bi-directional links (default: 16, higher = better recall, slower)
+                    ef_construct=200,  # Size of dynamic candidate list (default: 100, higher = better quality)
+                    full_scan_threshold=10000,  # Use full scan if collection is smaller
+                )
+                
+                self.client.create_collection(
+                    collection_name=self.COLLECTION_NAME,
+                    vectors_config=VectorParams(
+                        size=self.dimension,
+                        distance=Distance.COSINE,
+                        hnsw_config=hnsw_config,
+                    ),
+                )
+            else:
+                # Check if existing collection has correct dimension
+                try:
+                    collection_info = self.client.get_collection(self.COLLECTION_NAME)
+                    existing_dim = collection_info.config.params.vectors.size
+                    
+                    if existing_dim != self.dimension:
+                        # Dimension mismatch - need to recreate collection
+                        print(f"Warning: Vector store dimension mismatch ({existing_dim} vs {self.dimension}).")
+                        print("Recreating collection with correct dimension. Existing vectors will be lost.")
+                        print("You may need to re-index your screenshots.")
+                        
+                        # Delete and recreate collection with optimized HNSW
+                        self.client.delete_collection(self.COLLECTION_NAME)
+                        hnsw_config = HnswConfigDiff(
+                            m=16,
+                            ef_construct=200,
+                            full_scan_threshold=10000,
+                        )
+                        self.client.create_collection(
+                            collection_name=self.COLLECTION_NAME,
+                            vectors_config=VectorParams(
+                                size=self.dimension,
+                                distance=Distance.COSINE,
+                                hnsw_config=hnsw_config,
+                            ),
+                        )
+                except Exception as e:
+                    print(f"Warning: Could not verify collection dimension: {e}")
+                    # Continue anyway - will fail on add if dimension is wrong
     
     def add(
         self,
@@ -72,20 +138,39 @@ class VectorStore:
             file_path: Path to the screenshot file
             metadata: Additional metadata to store
         """
-        payload = metadata or {}
-        if file_path:
-            payload["file_path"] = file_path
-        
-        point = PointStruct(
-            id=id,
-            vector=vector,
-            payload=payload,
-        )
-        
-        self.client.upsert(
-            collection_name=self.COLLECTION_NAME,
-            points=[point],
-        )
+        with self._lock:
+            # Combine metadata
+            doc_metadata = metadata or {}
+            if file_path:
+                doc_metadata["file_path"] = file_path
+            doc_metadata["id"] = id
+            
+            # Create a Document with the vector
+            # LangChain Qdrant uses documents, but we need to add vectors directly
+            # We'll use the underlying client to add vectors directly
+            from qdrant_client.models import PointStruct
+            
+            point = PointStruct(
+                id=id,
+                vector=vector,
+                payload=doc_metadata,
+            )
+            
+            try:
+                self.client.upsert(
+                    collection_name=self.COLLECTION_NAME,
+                    points=[point],
+                )
+            except Exception as e:
+                # If client is closed, try to recreate it
+                if "closed" in str(e).lower():
+                    self.client = QdrantClient(path=str(self.path))
+                    self.client.upsert(
+                        collection_name=self.COLLECTION_NAME,
+                        points=[point],
+                    )
+                else:
+                    raise
     
     def add_batch(
         self,
@@ -102,24 +187,39 @@ class VectorStore:
             file_paths: Optional list of file paths
             metadata_list: Optional list of metadata dicts
         """
-        points = []
-        for i, (id_, vector) in enumerate(zip(ids, vectors)):
-            payload = {}
-            if metadata_list and i < len(metadata_list):
-                payload = metadata_list[i] or {}
-            if file_paths and i < len(file_paths):
-                payload["file_path"] = file_paths[i]
+        with self._lock:
+            from qdrant_client.models import PointStruct
             
-            points.append(PointStruct(
-                id=id_,
-                vector=vector,
-                payload=payload,
-            ))
-        
-        self.client.upsert(
-            collection_name=self.COLLECTION_NAME,
-            points=points,
-        )
+            points = []
+            for i, (id_, vector) in enumerate(zip(ids, vectors)):
+                payload = {}
+                if metadata_list and i < len(metadata_list):
+                    payload = metadata_list[i] or {}
+                if file_paths and i < len(file_paths):
+                    payload["file_path"] = file_paths[i]
+                payload["id"] = id_
+                
+                points.append(PointStruct(
+                    id=id_,
+                    vector=vector,
+                    payload=payload,
+                ))
+            
+            try:
+                self.client.upsert(
+                    collection_name=self.COLLECTION_NAME,
+                    points=points,
+                )
+            except Exception as e:
+                # If client is closed, try to recreate it
+                if "closed" in str(e).lower():
+                    self.client = QdrantClient(path=str(self.path))
+                    self.client.upsert(
+                        collection_name=self.COLLECTION_NAME,
+                        points=points,
+                    )
+                else:
+                    raise
     
     def search(
         self,
@@ -137,51 +237,105 @@ class VectorStore:
         Returns:
             List of search results ordered by similarity
         """
-        # Use query_points for newer qdrant-client versions
-        results = self.client.query_points(
-            collection_name=self.COLLECTION_NAME,
-            query=query_vector,
-            limit=limit,
-            score_threshold=score_threshold,
-        )
-        
-        return [
-            VectorSearchResult(
-                id=int(r.id),
-                score=r.score,
-                file_path=r.payload.get("file_path") if r.payload else None,
-            )
-            for r in results.points
-        ]
+        with self._lock:
+            # Use direct client query for vector search
+            # (LangChain QdrantVectorStore works with Documents, but we use pre-computed vectors)
+            try:
+                results = self.client.query_points(
+                    collection_name=self.COLLECTION_NAME,
+                    query=query_vector,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                )
+            except Exception as e:
+                # If client is closed, try to recreate it
+                if "closed" in str(e).lower():
+                    self.client = QdrantClient(path=str(self.path))
+                    results = self.client.query_points(
+                        collection_name=self.COLLECTION_NAME,
+                        query=query_vector,
+                        limit=limit,
+                        score_threshold=score_threshold,
+                    )
+                else:
+                    raise
+            
+            return [
+                VectorSearchResult(
+                    id=int(r.id),
+                    score=r.score,
+                    file_path=r.payload.get("file_path") if r.payload else None,
+                )
+                for r in results.points
+            ]
     
     def delete(self, id: int) -> None:
         """Delete a vector by ID."""
-        self.client.delete(
-            collection_name=self.COLLECTION_NAME,
-            points_selector=[id],
-        )
+        with self._lock:
+            try:
+                self.client.delete(
+                    collection_name=self.COLLECTION_NAME,
+                    points_selector=[id],
+                )
+            except Exception as e:
+                if "closed" in str(e).lower():
+                    self.client = QdrantClient(path=str(self.path))
+                    self.client.delete(
+                        collection_name=self.COLLECTION_NAME,
+                        points_selector=[id],
+                    )
+                else:
+                    raise
     
     def delete_batch(self, ids: list[int]) -> None:
         """Delete multiple vectors by ID."""
         if ids:
-            self.client.delete(
-                collection_name=self.COLLECTION_NAME,
-                points_selector=ids,
-            )
+            with self._lock:
+                try:
+                    self.client.delete(
+                        collection_name=self.COLLECTION_NAME,
+                        points_selector=ids,
+                    )
+                except Exception as e:
+                    if "closed" in str(e).lower():
+                        self.client = QdrantClient(path=str(self.path))
+                        self.client.delete(
+                            collection_name=self.COLLECTION_NAME,
+                            points_selector=ids,
+                        )
+                    else:
+                        raise
     
     def get_count(self) -> int:
         """Get the number of vectors in the store."""
-        info = self.client.get_collection(self.COLLECTION_NAME)
-        return info.points_count
+        with self._lock:
+            try:
+                info = self.client.get_collection(self.COLLECTION_NAME)
+                return info.points_count
+            except Exception as e:
+                if "closed" in str(e).lower():
+                    self.client = QdrantClient(path=str(self.path))
+                    info = self.client.get_collection(self.COLLECTION_NAME)
+                    return info.points_count
+                else:
+                    raise
     
     def clear(self) -> None:
         """Delete and recreate the collection."""
-        self.client.delete_collection(self.COLLECTION_NAME)
-        self._ensure_collection()
+        with self._lock:
+            self.client.delete_collection(self.COLLECTION_NAME)
+            self._ensure_collection()
     
     def close(self) -> None:
         """Close the client connection."""
-        self.client.close()
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self.client.close()
+                except Exception:
+                    pass  # Ignore errors when closing
+        # LangChain vector store doesn't need explicit closing
     
     def __enter__(self):
         return self

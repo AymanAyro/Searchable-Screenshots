@@ -794,12 +794,35 @@ class MainWindow(QMainWindow):
         # Initialize services
         self.config_manager = ConfigManager()
         self.db = Database(self.config_manager.db_path)
-        self.vector_store = VectorStore(self.config_manager.vector_store_path)
         
         api_config = self.config_manager.config.api
+        app_config = self.config_manager.config
         self.ocr = OCRService()
-        self.vision = VisionService(api_config.ollama_url, api_config.vision_model)
-        self.embedding = EmbeddingService(api_config.ollama_url, api_config.embed_model)
+        self.vision = VisionService(
+            api_config.ollama_url, 
+            api_config.vision_model,
+            prompt_style=app_config.vision_prompt_style
+        )
+        self.embedding = EmbeddingService(
+            api_config.ollama_url, 
+            api_config.embed_model,
+            cache_enabled=app_config.embedding_cache_enabled
+        )
+        
+        # Detect embedding dimension and create vector store with correct dimension
+        embedding_dim = None
+        if self.embedding.dimension:
+            embedding_dim = self.embedding.dimension
+        else:
+            # Try to get dimension by embedding a test string
+            test_embedding = self.embedding.embed("test")
+            if test_embedding:
+                embedding_dim = len(test_embedding)
+        
+        self.vector_store = VectorStore(
+            self.config_manager.vector_store_path,
+            dimension=embedding_dim
+        )
         
         # Initialize sparse embedding service (BM25)
         self.sparse_embedding = SparseEmbeddingService()
@@ -818,6 +841,8 @@ class MainWindow(QMainWindow):
             reranker=self.reranker,
             use_reranker=self.config_manager.config.use_reranker,
             hybrid_weight=self.config_manager.config.hybrid_search_weight,
+            hybrid_normalization=app_config.hybrid_normalization,
+            use_query_expansion=app_config.use_query_expansion,
         )
         
         self.processor = ScreenshotProcessor(
@@ -1108,6 +1133,40 @@ class MainWindow(QMainWindow):
     def on_settings(self):
         dialog = SettingsDialog(self.config_manager, self)
         if dialog.exec():
+            # Re-initialize services with new model names if they changed
+            api_config = self.config_manager.config.api
+            old_vision_model = self.vision.model
+            old_embed_model = self.embedding.model
+            
+            # Re-initialize vision service if model changed
+            app_config = self.config_manager.config
+            if old_vision_model != api_config.vision_model or self.vision.ollama_url != api_config.ollama_url:
+                self.vision = VisionService(
+                    api_config.ollama_url, 
+                    api_config.vision_model,
+                    prompt_style=app_config.vision_prompt_style
+                )
+                # Update processor reference
+                self.processor.vision = self.vision
+            
+            # Re-initialize embedding service if model changed
+            if old_embed_model != api_config.embed_model or self.embedding.ollama_url != api_config.ollama_url:
+                self.embedding = EmbeddingService(
+                    api_config.ollama_url, 
+                    api_config.embed_model,
+                    cache_enabled=app_config.embedding_cache_enabled
+                )
+                # Update processor and search engine references
+                self.processor.embedding = self.embedding
+                self.search_engine.embedding = self.embedding
+            
+            # Update search engine config
+            self.search_engine.hybrid_normalization = app_config.hybrid_normalization
+            self.search_engine.use_query_expansion = app_config.use_query_expansion
+                
+                # Note: Changing embedding model may change dimension, but we don't reinitialize
+                # vector store here as it would require re-indexing all data
+            
             # Update search engine with new hybrid weight
             self.search_engine.hybrid_weight = self.config_manager.config.hybrid_search_weight
             self.update_status()
